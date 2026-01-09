@@ -1,0 +1,85 @@
+/**
+ * 【最終改善版】シートのセルが編集されたときに自動実行される関数
+ * ヘッダー行の日付を読み取り、A-D列が空でなければ、現在より前の月に「未加入」と入力します。
+ * @param {Object} e - イベントオブジェクト。編集に関する情報が含まれます。
+ */
+function onEdit(e) {
+  // --- 基本情報のログ出力 ---
+  console.log("onEditトリガーが実行されました。");
+
+  // 手動実行などでイベントオブジェクトeが存在しない場合は処理を終了
+  if (!e || !e.range) {
+    console.log("手動実行かイベント情報不足のため、処理をスキップしました。");
+    return;
+  }
+
+  // 編集されたシートやセルの情報を取得
+  const sheet = e.source.getActiveSheet();
+  const range = e.range;
+  const editedRow = range.getRow();
+  const editedCol = range.getColumn();
+  
+  console.log(`編集されたシート: '${sheet.getName()}', セル: ${range.getA1Notation()}, 新しい値: '${e.value}'`);
+
+  // ---- 設定項目 ----
+  const TARGET_SHEET_NAME = "提出状況";
+  const TRIGGER_COLUMN = 5;       // E列
+  const TRIGGER_VALUE = "有効";
+  const START_MONTH_COLUMN = 6;  // 月のデータが始まる列（F列）
+
+  // --- 条件分岐のチェック ---
+
+  // 1. シート名、ヘッダー行、トリガー条件のチェック
+  if (sheet.getName() !== TARGET_SHEET_NAME || editedRow === 1 || editedCol !== TRIGGER_COLUMN || e.value !== TRIGGER_VALUE) {
+    console.log("処理対象の条件（シート名、編集行、E列の値）に一致しなかったため、処理を終了します。");
+    return;
+  }
+
+  console.log("条件（E列が'有効'）に一致しました。A-D列のチェックを行います。");
+
+  const conditionRange = sheet.getRange(editedRow, 1, 1, 4); // A列からD列
+  const conditionValues = conditionRange.getValues()[0];
+  const [colA, colB, colC, colD] = conditionValues;
+  
+  // ---【変更箇所】データ型ではなく、セルが空かどうかをチェック ---
+  if (colA === '' || colB === '' || colC === '' || colD === '') {
+    console.log("エラー: A-D列のいずれかが空欄のため、処理を中断しました。");
+    return;
+  }
+
+  // --- これ以降のロジックはご指示通りです ---
+  console.log("A-D列はすべて入力済みです。ヘッダーの日付を元に'未加入'の書き込み処理を開始します。");
+  
+  // 現在の日付を取得（比較のため、日付は1日に設定）
+  const currentDate = new Date();
+  currentDate.setHours(0, 0, 0, 0); // 時刻をリセット
+  currentDate.setDate(1);           // 今月の1日とする
+
+  // ヘッダー行（1行目）のすべての値を取得
+  const lastCol = sheet.getLastColumn();
+  const headers = sheet.getRange(1, START_MONTH_COLUMN, 1, lastCol - START_MONTH_COLUMN + 1).getValues()[0];
+  
+  // 各ヘッダー列をチェック
+  headers.forEach((header, index) => {
+    // ヘッダーが "YYYY年M月" の形式かチェック
+    if (typeof header === 'string' && header.match(/^\d{4}年\d{1,2}月$/)) {
+      
+      // ヘッダー文字列から日付オブジェクトを生成 (例: "2025年6月" -> 2025/06/01)
+      const headerDate = new Date(header.replace('年', '/').replace('月', '/1'));
+      
+      // 【重要】ヘッダーの日付が、現在の月より前の場合
+      if (headerDate < currentDate) {
+        const targetColumn = START_MONTH_COLUMN + index;
+        const targetCell = sheet.getRange(editedRow, targetColumn);
+        
+        // セルが空の場合のみ値を設定
+        if (targetCell.getValue() === '') {
+          targetCell.setValue('未加入');
+          console.log(`${editedRow}行目${targetColumn}列（${header}）に'未加入'と入力しました。`);
+        }
+      }
+    }
+  });
+  
+  console.log("処理が完了しました。");
+}
