@@ -1,0 +1,140 @@
+/**
+ * @fileoverview
+ * Googleフォームからの提出に応じてスプレッドシートのステータスを更新し、
+ * Slackにリアルタイムで通知を送信します。
+ *
+ * このファイルには2つの関数が含まれています。
+ * 1. recordSubmissionStatusBasedOnActualLayout: フォーム送信時に実行され、シートを更新し、通知関数を呼び出す。
+ * 2. sendSlackNotificationFromForm: Slack通知の実際の処理を行う。
+ *
+ * @version 2.0
+ */
+
+// このスクリプトで利用される定数です。
+// ご自身のプロジェクトですでに定義済みの場合は、このブロックを削除しても構いません。
+const SPREADSHEET_NAME = "提出状況";
+const ID_COLUMN_HEADER = "ID";
+const SUBMITTED_VALUE = "済"; // このスクリプト内では直接使用されませんが、参考として記載
+// 機密情報はScriptPropertiesから取得
+const SLACK_WEBHOOK_URL = PropertiesService.getScriptProperties().getProperty('SLACK_WEBHOOK_URL_ADMIN') || '';
+
+
+/**
+ * フォーム送信時にトリガーされ、「提出状況」シートを更新し、Slackに通知します。
+ * @param {GoogleAppsScript.Events.SheetsOnFormSubmit} e フォーム送信イベントオブジェクト
+ */
+function recordSubmissionStatusBasedOnActualLayout(e) {
+  // --- 基本設定 ---
+  const statusSheetName = SPREADSHEET_NAME; // 定数を利用
+  const doneText = SUBMITTED_VALUE; // 定数を利用
+
+  const emailColIndexInForm = 1;     // 「フォームの回答」シートのB列
+  const targetMonthColIndexInForm = 3; // 「フォームの回答」シートのD列
+  const submissionProofColIndexInForm = 4; // 「フォームの回答」シートのE列
+  const emailColIndexInStatusSheet = 1;  // 「提出状況」シートのA列
+  const headerRowInStatusSheet = 1;      // 「提出状況」シートの1行目
+
+  if (!e || !e.values) {
+    Logger.log("この関数はフォーム送信トリガーによって実行されることを想定しています。");
+    return;
+  }
+
+  // --- フォームからの値の取得と検証 ---
+  const submittedValues = e.values;
+  const submittedEmail = submittedValues[emailColIndexInForm];
+  const targetMonthText = submittedValues[targetMonthColIndexInForm];
+  const submissionProof = submittedValues[submissionProofColIndexInForm];
+
+  if (!submittedEmail || !targetMonthText || !submissionProof) {
+    Logger.log("フォームの必須項目が不足しているため処理をスキップしました。");
+    return;
+  }
+
+  // --- スプレッドシートの操作 ---
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const statusSheet = ss.getSheetByName(statusSheetName);
+
+  if (!statusSheet) {
+    Logger.log(`シート "${statusSheetName}" が見つかりません。`);
+    return;
+  }
+
+  const statusHeaders = statusSheet.getRange(headerRowInStatusSheet, 1, 1, statusSheet.getLastColumn()).getValues()[0];
+  
+  // メールアドレスから対象行を検索
+  const emailList = statusSheet.getRange(2, emailColIndexInStatusSheet, statusSheet.getLastRow() - 1, 1).getValues();
+  let emailRowInStatusSheet = -1;
+  for (let i = 0; i < emailList.length; i++) {
+    if (emailList[i][0] === submittedEmail) {
+      emailRowInStatusSheet = i + 2;
+      break;
+    }
+  }
+
+  if (emailRowInStatusSheet === -1) {
+    Logger.log(`メールアドレス "${submittedEmail}" がシートに見つかりませんでした。`);
+    return;
+  }
+
+  // 月から対象列を検索（なければ追加）
+  let monthColInStatusSheet = statusHeaders.indexOf(targetMonthText) + 1;
+  if (monthColInStatusSheet === 0) {
+    monthColInStatusSheet = statusSheet.getLastColumn() + 1;
+    statusSheet.getRange(headerRowInStatusSheet, monthColInStatusSheet).setValue(targetMonthText);
+    Logger.log(`新しい月のヘッダー "${targetMonthText}" を追加しました。`);
+  }
+
+  // 「済」を入力
+  statusSheet.getRange(emailRowInStatusSheet, monthColInStatusSheet).setValue(doneText);
+  Logger.log(`"${statusSheetName}" シートの ${emailRowInStatusSheet}行, ${monthColInStatusSheet}列に "${doneText}" と入力しました。`);
+
+  // ▼▼▼ ここからが追加部分 ▼▼▼
+
+  // SlackユーザーIDを取得
+  const idColumnIndex = statusHeaders.indexOf(ID_COLUMN_HEADER) + 1;
+  if (idColumnIndex === 0) {
+    Logger.log(`エラー: ヘッダーに "${ID_COLUMN_HEADER}" が見つかりませんでした。`);
+    return;
+  }
+  const slackUserId = statusSheet.getRange(emailRowInStatusSheet, idColumnIndex).getValue();
+
+  // 通知用の関数を呼び出す（1行追加）
+  sendSlackNotificationFromForm(slackUserId, targetMonthText);
+
+  // ▲▲▲ ここまでが追加部分 ▲▲▲
+}
+
+
+/**
+ * Slackに通知メッセージを送信するための専用関数
+ * @param {string} userId   メンションするSlackユーザーのID
+ * @param {string} month    提出された月 (例: "4月")
+ */
+function sendSlackNotificationFromForm(userId, month) {
+  if (!userId) {
+    Logger.log("通知対象のSlackユーザーIDが見つからないため、通知をスキップしました。");
+    return;
+  }
+  
+  // 送信するメッセージを組み立てる
+  const message = `<@${userId}> さんが${month}分の領収書を提出しました！`;
+
+  // Slackに送信するデータ（ペイロード）を作成
+  const payload = JSON.stringify({ 'text': message });
+
+  // HTTPリクエストのオプションを設定
+  const options = {
+    'method': 'post',
+    'contentType': 'application/json',
+    'payload': payload,
+    'muteHttpExceptions': true,
+  };
+
+  try {
+    // Webhook URLを使ってSlackに通知を送信
+    const response = UrlFetchApp.fetch(SLACK_WEBHOOK_URL, options);
+    Logger.log(`Slack通知を試行しました。Status: ${response.getResponseCode()}`);
+  } catch (error) {
+    Logger.log(`Slack通知中にエラーが発生しました: ${error.toString()}`);
+  }
+}

@@ -1,0 +1,100 @@
+function getSlackUsers() {
+  // 機密情報はScriptPropertiesから取得
+  const token = PropertiesService.getScriptProperties().getProperty('SLACK_API_TOKEN') || ''; // ScriptPropertiesに設定したSlackのOAuthトークンを使用
+  if (!token) {
+    SpreadsheetApp.getUi().alert('エラー: SLACK_API_TOKENがScriptPropertiesに設定されていません。');
+    return;
+  }
+  const sheetName = 'Slackユーザー一覧';
+  const url = 'https://slack.com/api/users.list';
+
+  const options = {
+    'method': 'get',
+    'contentType': 'application/x-www-form-urlencoded',
+    'headers': {
+      'Authorization': 'Bearer ' + token
+    }
+  };
+
+  let members = [];
+  let cursor = undefined;
+
+  try {
+    do {
+      let fetchUrl = url;
+      // (ページネーションのロジックは省略 - 前回のコードと同様)
+      if (cursor) {
+        fetchUrl += (fetchUrl.includes('?') ? '&' : '?') + 'cursor=' + encodeURIComponent(cursor);
+        if (options.payload && options.payload.limit) {
+             fetchUrl += '&limit=' + options.payload.limit;
+        }
+      } else if (options.payload && options.payload.limit) {
+          fetchUrl += '?limit=' + options.payload.limit;
+      }
+
+      const response = UrlFetchApp.fetch(fetchUrl, options);
+      const json = JSON.parse(response.getContentText());
+
+      if (json.ok) {
+        members = members.concat(json.members);
+        cursor = json.response_metadata && json.response_metadata.next_cursor ? json.response_metadata.next_cursor : undefined;
+      } else {
+        Logger.log('Slack API Error: ' + json.error);
+        SpreadsheetApp.getUi().alert('Slack API Error: ' + json.error + '\n\nOAuthトークンやSlackアプリの権限スコープ (users:read, users:read.email) を確認してください。');
+        return;
+      }
+    } while (cursor);
+
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    let sheet = ss.getSheetByName(sheetName);
+
+    if (!sheet) {
+      sheet = ss.insertSheet(sheetName);
+    }
+
+    sheet.clearContents();
+
+    // ヘッダー行に「最終更新日時」を追加
+    const headers = ['メールアドレス', 'ID', 'ユーザー名 (name)', '表示名 (real_name)', '最終更新日時', 'ボットか', '管理者か', 'タイムゾーン', 'ステータス絵文字', 'ステータステキスト', '役職 (title)'];
+    sheet.appendRow(headers);
+    sheet.getRange(1, 1, 1, headers.length).setFontWeight('bold');
+
+    members.forEach(function(member) {
+      if (!member.deleted && !member.is_bot) {
+        // Unixタイムスタンプを日付文字列に変換 (JSTで表示)
+        let updatedDate = '';
+        if (member.updated) {
+          updatedDate = new Date(member.updated * 1000).toLocaleString('ja-JP', { timeZone: 'Asia/Tokyo' });
+        }
+
+        sheet.appendRow([
+          member.profile ? member.profile.email || '' : '',
+          member.id,
+          member.name || '',
+          member.real_name || '',
+          updatedDate, // 最終更新日時
+          member.is_bot,
+          member.is_admin,
+          member.tz_label || '',
+          member.profile ? member.profile.status_emoji || '' : '',
+          member.profile ? member.profile.status_text || '' : '',
+          member.profile ? member.profile.title || '' : ''
+        ]);
+      }
+    });
+
+    
+    Logger.log('Slackユーザー一覧の取得が完了しました。処理ユーザー数: ' + members.filter(m => !m.deleted && !m.is_bot).length);
+
+  } catch (e) {
+    Logger.log('Error: ' + e.toString());
+    SpreadsheetApp.getUi().alert('スクリプト実行中にエラーが発生しました: ' + e.toString());
+  }
+}
+
+function onOpen() {
+  SpreadsheetApp.getUi()
+      .createMenu('Slack連携')
+      .addItem('ユーザー一覧を取得', 'getSlackUsers')
+      .addToUi();
+}

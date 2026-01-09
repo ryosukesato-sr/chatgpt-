@@ -1,0 +1,365 @@
+/**
+ * 提出状況の確認と各種通知を送信するメイン関数です。
+ * 提出が月をまたいで遅れるケースに対応するため、過去の全ての未完了月を追跡します。
+ * 1. 毎月20日（または翌営業日）に、提出依頼を通知します。
+ * 2. 過去に未完了の月があれば、最も古い月の未提出者にリマインドを送信します。
+ * 3. 過去の月が完了したのを検知したら、その時点で完了報告をします。
+ * 4. 過去の月が全て完了している場合のみ、当月のリマインド（25日以降）を行います。
+ * 5. 「未加入」が記載されている月のみ、未加入者をリマインド対象から除外します。
+ * * この関数を毎日実行するトリガーを1つ設定してください。
+ */
+function notifyReceiptStatusWithSummary() {
+  // --- 基本設定 ---
+  const SPREADSHEET_NAME = "提出状況";
+  const STATUS_COLUMN_HEADER = "ステータス";
+  const ID_COLUMN_HEADER = "ID";
+  const SUBMITTED_VALUE = "済";
+  const UNSUBSCRIBED_VALUE = "未加入";
+  // 機密情報はScriptPropertiesから取得
+  const scriptProperties = PropertiesService.getScriptProperties();
+  const SLACK_WEBHOOK_URL = scriptProperties.getProperty('SLACK_WEBHOOK_URL') || '';
+  const SLACK_WEBHOOK_URL_ADMIN = scriptProperties.getProperty('SLACK_WEBHOOK_URL_ADMIN') || '';
+  const SLACK_WEBHOOK_DRIVE_STORAGE = scriptProperties.getProperty('SLACK_WEBHOOK_DRIVE_STORAGE') || '';
+  const FORM_ID = scriptProperties.getProperty('FORM_ID') || '';
+  const FORM_URL = FORM_ID ? `https://docs.google.com/forms/d/${FORM_ID}/edit` : '';
+  const TARGET_MONTH_QUESTION_TITLE = "提出対象月";
+  const INITIAL_REMINDER_DAY = 20;
+  const SUBMISSION_CHECK_START_DAY = 25;
+
+  // --- 日付関連の準備 ---
+  const today = new Date();
+  const year = today.getFullYear();
+  const month = today.getMonth();
+
+  // --- ★★★ 1. 毎月20日の提出依頼通知 ★★★ ---
+  let initialReminderDate = new Date(year, month, INITIAL_REMINDER_DAY);
+  // 20日が土日祝日の場合は翌営業日にずらす
+  while (isWeekend(initialReminderDate) || isJapaneseHoliday(initialReminderDate)) {
+    initialReminderDate.setDate(initialReminderDate.getDate() + 1);
+  }
+  if (today.getFullYear() === initialReminderDate.getFullYear() &&
+      today.getMonth() === initialReminderDate.getMonth() &&
+      today.getDate() === initialReminderDate.getDate()) {
+    const targetMonthStr = `${year}年${month + 1}月分`;
+    const message = `📢【ChatGPT 領収書提出のお願い】\n\nお疲れ様です！\n今月分のChatGPTに関する領収書の提出をお願いいたします。\n\n領収書取得方法はこちら👇\nhttps://showroom.esa.io/posts/11417\n\n提出フォームはこちら👇\n📄 https://forms.gle/AS3s9VZ6iG1AwT1FA\n\n対象月：${targetMonthStr}\n締切：月末まで\n\nご不明点があればお気軽にご連絡ください。\nよろしくお願いいたします！`;
+    sendSlackNotification(message, SLACK_WEBHOOK_URL);
+    Logger.log(`提出依頼の通知（${targetMonthStr}）を送信しました。`);
+    return;
+  }
+
+  // --- ★★★ 2. リマインドと完了報告 ★★★ ---
+  // 土日祝日はリマインドと完了報告を行わない
+  if (isWeekend(today) || isJapaneseHoliday(today)) {
+    Logger.log("通知対象外の日（土日または祝日）のため、処理を終了します。");
+    return;
+  }
+
+  // --- スプレッドシートのデータ取得 ---
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  const sheet = ss.getSheetByName(SPREADSHEET_NAME);
+  if (!sheet) {
+    Logger.log(`エラー: シート「${SPREADSHEET_NAME}」が見つかりません。`);
+    return;
+  }
+  const allValues = sheet.getDataRange().getValues();
+  const headerRow = allValues[0];
+  const idColIndex = headerRow.indexOf(ID_COLUMN_HEADER);
+  const statusIndex = headerRow.indexOf(STATUS_COLUMN_HEADER);
+  if (idColIndex === -1 || statusIndex === -1) {
+    Logger.log(`エラー: ヘッダー「${ID_COLUMN_HEADER}」または「${STATUS_COLUMN_HEADER}」が見つかりません。`);
+    return;
+  }
+  
+  // --- 提出状況の集計を行う共通関数 ---
+  const getSubmissionStatus = (targetCol) => {
+    let submitted = 0;
+    let unsubmitted = 0;
+    const mentions = [];
+    
+    // 対象月に「未加入」があるかチェック
+    let hasUnsubscribed = false;
+    for (let i = 1; i < allValues.length; i++) {
+        const status = allValues[i][targetCol] ? allValues[i][targetCol].toString().trim() : '';
+        if (status === UNSUBSCRIBED_VALUE) {
+            hasUnsubscribed = true;
+            break;
+        }
+    }
+
+    for (let i = 1; i < allValues.length; i++) {
+        const row = allValues[i];
+        if (row[statusIndex] === "有効") {
+            const userId = row[idColIndex];
+            const submissionStatus = row[targetCol] ? row[targetCol].toString().trim() : '';
+            
+            if (submissionStatus === SUBMITTED_VALUE) {
+                submitted++;
+            } else {
+                let isUnsubmitted = false;
+                if (hasUnsubscribed) {
+                    if (submissionStatus !== UNSUBSCRIBED_VALUE) isUnsubmitted = true;
+                } else {
+                    isUnsubmitted = true;
+                }
+                if (isUnsubmitted) {
+                    unsubmitted++;
+                    if (userId) mentions.push(`<@${userId}>`);
+                }
+            }
+        }
+    }
+    return { submittedCount: submitted, unsubmittedCount: unsubmitted, unsubmittedMentions: mentions };
+  };
+  
+  // --- 通知対象月の決定ロジック ---
+  // ヘッダーから日付形式の列 ("YYYY年M月") を全て探し、過去のものから順にソートする
+  const monthColumns = [];
+  // 「過去の月」を定義するため、当月の初日を取得
+  const beginningOfCurrentMonth = new Date(today.getFullYear(), today.getMonth(), 1);
+
+  for (let i = 0; i < headerRow.length; i++) {
+    const header = headerRow[i];
+    const match = header.match(/^(\d{4})年(\d{1,2})月$/);
+    if (match) {
+      const monthDate = new Date(parseInt(match[1], 10), parseInt(match[2], 10) - 1, 1);
+      // 当月より前の月のみを「過去の月」として対象にする
+      if (monthDate < beginningOfCurrentMonth) {
+        monthColumns.push({ header: header, index: i, date: monthDate });
+      }
+    }
+  }
+  monthColumns.sort((a, b) => a.date - b.date); // 古い順にソート
+
+  const scriptProperties = PropertiesService.getScriptProperties();
+  const completedMonthsStr = scriptProperties.getProperty('completedMonths') || '{}';
+  const completedMonths = JSON.parse(completedMonthsStr);
+
+  // --- 過去の未完了月をチェック & 処理 ---
+  for (const col of monthColumns) {
+    if (!completedMonths[col.header]) {
+      const status = getSubmissionStatus(col.index);
+      
+      if (status.unsubmittedCount > 0) {
+        // 未提出者がいる ⇒ 最も古い未完了月としてリマインドを送信
+        Logger.log(`最も古い未完了月 (${col.header}) のリマインドを行います。`);
+        let message = `*📅 ${col.header} 提出状況 (再リマインド)*\n`;
+        message += `✅ *提出済み*: ${status.submittedCount}人\n`;
+        message += `⚠️ *未提出*: ${status.unsubmittedCount}人\n`;
+        message += `提出フォームはこちら:https://forms.gle/AS3s9VZ6iG1AwT1FA\n`;
+        if (status.unsubmittedMentions.length > 0) {
+          message += `\n*未提出の方一覧:*\n`;
+          message += status.unsubmittedMentions.join(', ') + '\n';
+        }
+        sendSlackNotification(message, SLACK_WEBHOOK_URL);
+        return; // この日の処理はこれで終わり
+      } else {
+        // 未提出者0人 ⇒ 完了通知を送信して記録
+        Logger.log(`過去の月 (${col.header}) の提出が完了したのを検知しました。`);
+        const generalCompletionMessage = `*📅 ${col.header} 提出状況*\n✅ *提出済み*: ${status.submittedCount}人\n⚠️ *未提出*: 0人\n\n🎉 全員の提出が完了しました！ご協力ありがとうございます！\n`;
+        sendSlackNotification(generalCompletionMessage, SLACK_WEBHOOK_URL);
+
+        // フォームの提出対象月を次の月に更新
+        const formUpdateResult = updateFormTargetMonth(col.header, FORM_ID, TARGET_MONTH_QUESTION_TITLE);
+
+        // 管理者通知メッセージに更新結果を反映
+        let adminMessage = `*📅 ${col.header} 提出状況*\n✅ *提出済み*: ${status.submittedCount}人\n⚠️ *未提出*: 0人\n\n🎉 全員の提出が完了しました！\n`;
+        if (formUpdateResult.success) {
+          adminMessage += `✅ フォームの提出対象月を${formUpdateResult.nextMonth}に更新しました。\n`;
+        } else {
+          adminMessage += `⚠️ フォームの更新に失敗しました: ${formUpdateResult.message}\n`;
+          adminMessage += `手動での更新をお願いいたします（${FORM_URL}）\n`;
+        }
+        sendSlackNotification(adminMessage, SLACK_WEBHOOK_URL_ADMIN);
+
+        const monthPart = col.header.replace(/^\d{4}年/, '');
+        // ★★★ 修正点: @HELP YOU を特定のユーザーIDへのメンションに変更 ★★★
+        const driveMessage = `<@U04K5TZ7EB1>\nお疲れ様です！\n${monthPart}分のChatGPTの領収書をGoogleドライブに格納済みです。\nご確認よろしくお願いいたします。`;
+        sendSlackNotification(driveMessage, SLACK_WEBHOOK_DRIVE_STORAGE);
+        
+        completedMonths[col.header] = true;
+        scriptProperties.setProperty('completedMonths', JSON.stringify(completedMonths));
+        Logger.log(`完了通知済み月として「${col.header}」を記録しました。`);
+        // 完了した月が1つ見つかったら、次の月に進まずに一旦処理を終了する
+        return; 
+      }
+    }
+  }
+  
+  // --- 過去の月が全て完了している場合、当月の処理を行う ---
+  if (today.getDate() < SUBMISSION_CHECK_START_DAY) {
+    Logger.log(`過去月は全て完了済み。当月のリマインド期間外です (${SUBMISSION_CHECK_START_DAY}日より前)。`);
+    return;
+  }
+
+  const currentMonthHeader = `${year}年${month + 1}月`;
+  const currentMonthColIndex = headerRow.indexOf(currentMonthHeader);
+
+  if (currentMonthColIndex !== -1) {
+    const status = getSubmissionStatus(currentMonthColIndex);
+    if (status.unsubmittedCount > 0) {
+      Logger.log(`当月 (${currentMonthHeader}) のリマインドを行います。`);
+      let message = `*📅 ${currentMonthHeader} 提出状況*\n`;
+      message += `✅ *提出済み*: ${status.submittedCount}人\n`;
+      message += `⚠️ *未提出*: ${status.unsubmittedCount}人\n`;
+      message += `提出フォームはこちら:https://forms.gle/AS3s9VZ6iG1AwT1FA\n`;
+      if (status.unsubmittedMentions.length > 0) {
+        message += `\n*未提出の方一覧:*\n`;
+        message += status.unsubmittedMentions.join(', ') + '\n';
+      }
+      sendSlackNotification(message, SLACK_WEBHOOK_URL);
+    } else {
+      Logger.log(`当月 (${currentMonthHeader}) は全員提出済みです。`);
+    }
+  } else {
+    Logger.log(`過去月は完了済みですが、当月 (${currentMonthHeader}) の列が見つかりません。`);
+  }
+}
+
+// --- 以下、補助関数 ---
+
+/**
+ * 指定された日付が週末（土日）かどうかを判定します。
+ * @param {Date} date 判定したい日付オブジェクト
+ * @return {boolean} 週末の場合は true, そうでない場合は false
+ */
+function isWeekend(date) {
+  const day = date.getDay();
+  return day === 0 || day === 6; // 0:日曜日, 6:土曜日
+}
+
+/**
+ * Googleカレンダーを利用して、指定された日付が日本の祝日かどうかを判定します。
+ * @param {Date} date 判定したい日付オブジェクト
+ * @return {boolean} 祝日の場合は true, そうでない場合は false
+ */
+function isJapaneseHoliday(date) {
+  const calendarId = 'ja.japanese#holiday@group.v.calendar.google.com';
+  const calendar = CalendarApp.getCalendarById(calendarId);
+  const events = calendar.getEventsForDay(date);
+  return events.length > 0;
+}
+
+/**
+ * Slackにメッセージを送信します。
+ * @param {string} message 送信するメッセージ本文
+ * @param {string} webhookUrl SlackのIncoming Webhook URL
+ */
+function sendSlackNotification(message, webhookUrl) {
+  const payload = {
+    "text": message
+  };
+  const options = {
+    "method": "post",
+    "contentType": "application/json",
+    "payload": JSON.stringify(payload)
+  };
+  try {
+    UrlFetchApp.fetch(webhookUrl, options);
+  } catch (e) {
+    Logger.log(`Slackへの通知送信に失敗しました。URL: ${webhookUrl}, エラー: ${e.message}`);
+  }
+}
+
+/**
+ * フォームの「提出対象月」選択肢を次の月に更新します。
+ * 既存の選択肢を全て削除し、新しい月のみを選択肢として設定します。
+ * @param {string} completedMonthHeader - 完了した月のヘッダー（例: "2025年5月"）
+ * @param {string} formId - フォームID
+ * @param {string} questionTitle - 質問項目のタイトル（デフォルト: "提出対象月"）
+ * @return {Object} {success: boolean, message: string, nextMonth: string}
+ */
+function updateFormTargetMonth(completedMonthHeader, formId, questionTitle) {
+  try {
+    // 完了した月から次月を計算
+    const match = completedMonthHeader.match(/^(\d{4})年(\d{1,2})月$/);
+    if (!match) {
+      return {
+        success: false,
+        message: `完了月のヘッダー形式が不正です: ${completedMonthHeader}`,
+        nextMonth: null
+      };
+    }
+
+    let year = parseInt(match[1], 10);
+    let month = parseInt(match[2], 10);
+    
+    // 次月を計算（12月の場合は翌年1月に）
+    month += 1;
+    if (month > 12) {
+      month = 1;
+      year += 1;
+    }
+    
+    const nextMonth = `${year}年${month}月`;
+
+    // フォームを取得
+    let form;
+    try {
+      form = FormApp.openById(formId);
+    } catch (e) {
+      return {
+        success: false,
+        message: `フォームの取得に失敗しました: ${e.message}`,
+        nextMonth: nextMonth
+      };
+    }
+
+    // 全ての質問項目を取得
+    const items = form.getItems();
+    let targetItem = null;
+
+    // 「提出対象月」の質問項目を探す
+    for (let i = 0; i < items.length; i++) {
+      if (items[i].getTitle() === questionTitle) {
+        targetItem = items[i];
+        break;
+      }
+    }
+
+    if (!targetItem) {
+      return {
+        success: false,
+        message: `「${questionTitle}」というタイトルの質問項目が見つかりませんでした。`,
+        nextMonth: nextMonth
+      };
+    }
+
+    // 質問項目のタイプが選択肢系（LIST、MULTIPLE_CHOICE）であることを確認
+    const itemType = targetItem.getType();
+    if (itemType !== FormApp.ItemType.LIST && itemType !== FormApp.ItemType.MULTIPLE_CHOICE) {
+      return {
+        success: false,
+        message: `「${questionTitle}」は選択肢形式の質問ではありません（タイプ: ${itemType}）。`,
+        nextMonth: nextMonth
+      };
+    }
+
+    // 選択肢を更新（既存の選択肢を全て削除し、新しい月のみを追加）
+    const listItem = targetItem.asListItem();
+    
+    // 既存の選択肢を全て削除
+    const existingChoices = listItem.getChoices();
+    if (existingChoices.length > 0) {
+      listItem.setChoices([]);
+    }
+
+    // 新しい月の選択肢を追加
+    listItem.setChoices([listItem.createChoice(nextMonth)]);
+
+    Logger.log(`フォームの「${questionTitle}」を${nextMonth}に更新しました。`);
+    
+    return {
+      success: true,
+      message: `フォームの提出対象月を${nextMonth}に更新しました。`,
+      nextMonth: nextMonth
+    };
+
+  } catch (e) {
+    Logger.log(`フォーム更新中にエラーが発生しました: ${e.toString()}\nスタックトレース: ${e.stack}`);
+    return {
+      success: false,
+      message: `予期しないエラーが発生しました: ${e.message}`,
+      nextMonth: null
+    };
+  }
+}
