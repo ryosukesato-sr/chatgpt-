@@ -1,0 +1,73 @@
+function listAllUsersWithMoreDetails() {
+  const domain = "showroom.co.jp"; // ご自身のドメインに適宜変更してください
+  const sheetName = "社員マスタ";
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(sheetName);
+  if (sheet) {
+    sheet.clearContents(); // 既存のシートがあればクリア
+  } else {
+    sheet = ss.insertSheet(sheetName);
+  }
+
+  // シート初期化とヘッダー
+  sheet.appendRow([
+    "氏名", "メールアドレス", "部署", "職種", "アカウント作成日", "ステータス", "最終ログイン",
+    "2段階認証", "管理者", "次回パスワード変更" // 追加ヘッダー
+  ]);
+
+  let pageToken;
+  let usersProcessed = 0; // 処理済みユーザー数カウンター
+
+  SpreadsheetApp.getActiveSpreadsheet().toast("ユーザーリストの取得を開始します...", "処理状況", -1);
+
+
+  do {
+    const response = AdminDirectory.Users.list({
+      domain: domain,
+      maxResults: 100, // 1回のリクエストで取得する最大ユーザー数
+      orderBy: "givenName", // 名前の昇順で並び替え
+      pageToken: pageToken,
+      projection: "full", // 詳細情報を取得するために "full" を指定
+      viewType: "admin_view" // 管理者としての視点で全てのユーザー情報を取得
+    });
+
+    const users = response.users || [];
+
+    if (users.length === 0 && !pageToken) { // 初回でユーザーが0件の場合
+      SpreadsheetApp.getActiveSpreadsheet().toast("指定されたドメインにユーザーが見つかりませんでした。", "情報", 5);
+      sheet.appendRow(["ユーザーが見つかりませんでした。"]);
+      return;
+    }
+    
+    for (const user of users) {
+      const creationTime = user.creationTime ? new Date(user.creationTime) : "";
+      const lastLoginTime = user.lastLoginTime ? new Date(user.lastLoginTime) : "";
+
+      sheet.appendRow([
+        user.name.fullName || "",
+        user.primaryEmail || "",
+        user.orgUnitPath || "",
+        user.customSchemas?.職種情報?.職種 || "",
+        creationTime,
+        user.suspended ? "停止中" : "アクティブ",
+        lastLoginTime,
+        user.isEnrolledIn2Sv ? "有効" : "無効", // 2段階認証
+        user.isAdmin ? "はい" : "いいえ",      // 管理者
+        user.changePasswordAtNextLogin ? "はい" : "いいえ" // 次回パスワード変更
+      ]);
+      usersProcessed++;
+    }
+
+    pageToken = response.nextPageToken;
+    if (pageToken) {
+      SpreadsheetApp.getActiveSpreadsheet().toast(`${usersProcessed} 人のユーザー情報を取得済み。次のページを取得中...`, "処理状況", 10);
+    }
+
+  } while (pageToken);
+
+  SpreadsheetApp.getActiveSpreadsheet().toast(`完了: ${usersProcessed} 人のユーザー情報をシート '${sheetName}' に出力しました。`, "処理完了", 10);
+  // 列幅を自動調整
+  for (let i = 1; i <= sheet.getLastColumn(); i++) {
+    sheet.autoResizeColumn(i);
+  }
+}
